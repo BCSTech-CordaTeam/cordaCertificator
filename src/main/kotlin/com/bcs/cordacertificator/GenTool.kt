@@ -4,6 +4,10 @@ import net.corda.nodeapi.internal.crypto.X509KeyStore
 import net.corda.nodeapi.internal.crypto.X509Utilities
 import java.nio.file.Path
 import net.corda.core.identity.CordaX500Name
+import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_CLIENT_CA
+import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_CLIENT_TLS
+import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_INTERMEDIATE_CA
+import net.corda.nodeapi.internal.crypto.X509Utilities.CORDA_ROOT_CA
 import org.apache.commons.cli.*
 import java.nio.file.Paths
 
@@ -33,10 +37,14 @@ fun main(args: Array<String>) {
     val nodeDir = Option("nd", "node-dir", true, "Put the nodes' certificates under this directory")
     nodeDir.isRequired = false
 
+    val readCerts = Option("rc", "readcerts", false, "Instead of doing any writing, just read pre-existing certs and dump them.")
+    nodeDir.isRequired = false
+
     options.addOption(rootName)
     options.addOptionGroup(rootGroup)
     options.addOption(nodeNames)
     options.addOption(nodeDir)
+    options.addOption(readCerts)
 
     val parser = DefaultParser()
     val formatter = HelpFormatter()
@@ -72,6 +80,11 @@ fun main(args: Array<String>) {
         val rootCKP = rootStore.getCertificateAndKeyPair(X509Utilities.CORDA_ROOT_CA)
         val doormanCKP = doormanStore.getCertificateAndKeyPair(X509Utilities.CORDA_INTERMEDIATE_CA)
         val netmapCKP = netmapStore.getCertificateAndKeyPair("cordanetworkmapca")
+        if (cmd.hasOption("rc")) {
+            println(rootStore.getCertificateChain(CORDA_ROOT_CA).toString())
+            println(doormanStore.getCertificateChain(CORDA_INTERMEDIATE_CA).toString())
+            println(netmapStore.getCertificateChain("cordanetworkmapca").toString())
+        }
         zoneCerts = ZoneCerts(rootCKP, doormanCKP, netmapCKP)
     }
 
@@ -79,8 +92,12 @@ fun main(args: Array<String>) {
         val nodePath = Paths.get(cmd.getOptionValue("nd"))
         cmd.getOptionValues("nn").map {
             val name = CordaX500Name.parse(it)
-            val nodeCerts = generateNodeCerts(name, zoneCerts)
-            saveNodeCerts(nodeCerts, zoneCerts, nodePath, nodePass)
+            if (cmd.hasOption("rc")) {
+                printNodeCerts(name, nodePath, nodePass)
+            } else {
+                val nodeCerts = generateNodeCerts(name, zoneCerts)
+                saveNodeCerts(nodeCerts, zoneCerts, nodePath, nodePass)
+            }
         }
     }
 }
@@ -97,7 +114,7 @@ fun saveRootCerts(zoneCerts: ZoneCerts, rootPath: Path, password: String) {
         this.setPrivateKey(X509Utilities.CORDA_ROOT_CA, zoneCerts.root.keyPair.private, listOf(zoneCerts.root.certificate))
     }
     doormanStore.update {
-        this.setPrivateKey(X509Utilities.CORDA_INTERMEDIATE_CA, zoneCerts.doorman.keyPair.private, listOf(zoneCerts.root.certificate, zoneCerts.doorman.certificate))
+        this.setPrivateKey(X509Utilities.CORDA_INTERMEDIATE_CA, zoneCerts.doorman.keyPair.private, listOf(zoneCerts.doorman.certificate, zoneCerts.root.certificate))
     }
     netmapStore.update {
         this.setPrivateKey("cordanetworkmapca", zoneCerts.networkMap.keyPair.private, listOf(zoneCerts.networkMap.certificate))
@@ -108,30 +125,33 @@ fun saveRootCerts(zoneCerts: ZoneCerts, rootPath: Path, password: String) {
  * Helper function to save the node certs into keystores under a given root path with a given password.
  */
 fun saveNodeCerts(nodeCerts: NodeCerts, zoneCerts: ZoneCerts, rootPath: Path, password: String) {
-    val nodeCAStore = X509KeyStore.fromFile(rootPath.resolve("nodekeystore.jks"), password, createNew = true)
-    val tlsStore = X509KeyStore.fromFile(rootPath.resolve("sslkeystore.jks"), password, createNew = true)
-    val trustStore = X509KeyStore.fromFile(rootPath.resolve("truststore.jks"), password, createNew = true)
+    val caDir = "${nodeCerts.nodeCA.certificate.subjectX500Principal}"
+    val nodeCAStore = X509KeyStore.fromFile(rootPath.resolve(caDir).resolve("nodekeystore.jks"), password, createNew = true)
+    val tlsStore = X509KeyStore.fromFile(rootPath.resolve(caDir).resolve("sslkeystore.jks"), password, createNew = true)
+    val trustStore = X509KeyStore.fromFile(rootPath.resolve(caDir).resolve("truststore.jks"), password, createNew = true)
 
     nodeCAStore.update {
         this.setPrivateKey(
                 X509Utilities.CORDA_CLIENT_CA,
                 nodeCerts.nodeCA.keyPair.private,
                 listOf(
-                        zoneCerts.root.certificate,
+                        // This order is required!
+                        nodeCerts.nodeCA.certificate,
                         zoneCerts.doorman.certificate,
-                        nodeCerts.nodeCA.certificate
+                        zoneCerts.root.certificate
                 )
         )
     }
     tlsStore.update {
         this.setPrivateKey(
-                X509Utilities.CORDA_INTERMEDIATE_CA,
+                X509Utilities.CORDA_CLIENT_TLS,
                 nodeCerts.tls.keyPair.private,
                 listOf(
-                        zoneCerts.root.certificate,
-                        zoneCerts.doorman.certificate,
+                        // This order is required!
+                        nodeCerts.tls.certificate,
                         nodeCerts.nodeCA.certificate,
-                        nodeCerts.tls.certificate
+                        zoneCerts.doorman.certificate,
+                        zoneCerts.root.certificate
                 )
         )
     }
@@ -140,3 +160,17 @@ fun saveNodeCerts(nodeCerts: NodeCerts, zoneCerts: ZoneCerts, rootPath: Path, pa
     }
 }
 
+
+/**
+ * Helper function to print pre-generated node certs for a given path and name.
+ */
+fun printNodeCerts(name: CordaX500Name, rootPath: Path, password: String) {
+    val caDir = "${name.x500Principal}"
+    val nodeCAStore = X509KeyStore.fromFile(rootPath.resolve(caDir).resolve("nodekeystore.jks"), password, createNew = false)
+    val tlsStore = X509KeyStore.fromFile(rootPath.resolve(caDir).resolve("sslkeystore.jks"), password, createNew = false)
+    val trustStore = X509KeyStore.fromFile(rootPath.resolve(caDir).resolve("truststore.jks"), password, createNew = false)
+
+    println(nodeCAStore.getCertificateChain(CORDA_CLIENT_CA).toString())
+    println(tlsStore.getCertificateChain(CORDA_CLIENT_TLS).toString())
+    println(trustStore.getCertificate(CORDA_ROOT_CA).toString())
+}
